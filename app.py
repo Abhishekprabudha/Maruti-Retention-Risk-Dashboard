@@ -1,302 +1,515 @@
-import os, re, io, textwrap
-import streamlit as st
-import pandas as pd
+import os, re
 import numpy as np
-import pdfplumber
-from docx import Document
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
 
-# ---------- Config ----------
-st.set_page_config(page_title="Procurement Control Tower: Contracts + Supplier Ranking", page_icon="🧠", layout="wide")
-st.title("🧠 AI/Agentic AI – Autonomous Procurement Control Tower")
-st.caption("Upload a contract/RFP (PDF/DOCX) and a supplier spreadsheet (XLSX/CSV). Ask questions, rank suppliers, and demo autonomous decisions.")
+from dataclasses import dataclass
+from typing import Tuple, Dict, Any, Optional
 
-# ---------- State ----------
-if "history" not in st.session_state:
-    st.session_state.history = []
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score, average_precision_score, confusion_matrix
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
-# ---------- Helpers ----------
-def load_pdf(file) -> str:
-    txt = []
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            txt.append(t)
-    return "\n".join(txt)
+# ---------------- Page ----------------
+st.set_page_config(page_title="Maruti Suzuki — Retention Risk Dashboard", page_icon="🚗", layout="wide")
+st.title("🚗 Maruti Suzuki — Retention Risk Dashboard")
+st.caption("Detect customers at risk of churn (next 6 months), explain drivers, and simulate retention actions. Works offline; optional LLM Q&A if OPENAI_API_KEY is set.")
 
-def load_docx(file) -> str:
-    doc = Document(file)
-    return "\n".join([p.text for p in doc.paragraphs])
+# ---------------- Helpers ----------------
+TARGET_COL = "Churn6M"
+ID_COL = "CustomerID"
 
-def chunk_text(text, chunk_size=800):
-    words = text.split()
-    for i in range(0, len(words), chunk_size):
-        yield " ".join(words[i:i+chunk_size])
+NUM_COLS_DEFAULT = [
+    "Age","IncomeLPA","TenureMonths","CarAgeYears","OdometerKM","ServiceVisits12M",
+    "LastServiceDays","Complaints12M","NPS","AppLogins30D","WarrantyMonthsLeft",
+    "InsuranceRenewalDueDays","AccessoriesSpend12M","ServiceSpend12M"
+]
+CAT_COLS_DEFAULT = ["City","Segment","Model","FuelType","AcquisitionChannel","InsuranceProvider"]
+BIN_COLS_DEFAULT = ["ConnectedCar","WarrantyActive","DiscountSeeking","CompetitorQuoteSeen","ResaleIntent6M"]
 
-def find_best_passages(query, text, topk=3):
-    q = set(re.findall(r"\w+", query.lower()))
-    scored = []
-    for ch in chunk_text(text, 160):
-        t = set(re.findall(r"\w+", ch.lower()))
-        score = len(q & t)
-        if score > 0:
-            scored.append((score, ch))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:topk]]
+def load_demo_data() -> pd.DataFrame:
+    # The demo CSV is expected next to this app or in the working directory.
+    candidates = ["maruti_customer_demo.csv", "data/maruti_customer_demo.csv"]
+    for c in candidates:
+        if os.path.exists(c):
+            return pd.read_csv(c)
+    st.error("Demo CSV not found. Upload your CSV in the sidebar, or place maruti_customer_demo.csv next to app.")
+    st.stop()
 
-def safe_number(x):
-    try:
-        return float(x)
-    except:
-        return None
+def add_risk_band(p: pd.Series) -> pd.Series:
+    # Tuned for operational triage; adjust via UI threshold sliders if desired
+    bands = pd.cut(
+        p,
+        bins=[-1, 0.25, 0.55, 0.75, 1.01],
+        labels=["Low","Medium","High","Critical"]
+    )
+    return bands.astype(str)
 
-def parse_excel_query(q, df):
+def retention_playbook(row: pd.Series) -> Tuple[str, list]:
+    """Simple rule-based playbook to convert drivers into actions."""
+    actions = []
+    headline = "Proactive retention outreach"
+    if row.get("LastServiceDays", 0) >= 220:
+        actions.append("📅 Service reminder + priority slot (pick-up & drop)")
+    if row.get("WarrantyActive", 1) == 0:
+        actions.append("🛡️ Extended warranty offer (limited-time)")
+    if row.get("Complaints12M", 0) >= 2 or row.get("NPS", 0) <= 0:
+        actions.append("🧑‍🔧 Concierge escalation + RCA + goodwill coupon")
+    if row.get("CompetitorQuoteSeen", 0) == 1:
+        actions.append("🏷️ Match competitor quote + transparency breakdown")
+    if row.get("InsuranceRenewalDueDays", 999) <= 30:
+        actions.append("🧾 Insurance renewal bundle (service + add-ons)")
+    if row.get("ResaleIntent6M", 0) == 1:
+        actions.append("🔁 Buyback / exchange program with upgrade path")
+    if row.get("AppLogins30D", 0) == 0:
+        actions.append("📲 App reactivation: benefits + connected features demo")
+    if not actions:
+        actions = ["🎁 Loyalty benefit: free checkup + accessory voucher"]
+    return headline, actions
+
+def parse_df_query(q: str, df: pd.DataFrame):
     """
-    Domain-light parser for quick queries like:
-      - sum of UnitPriceUSD where Category=Fibre Cable
-      - average LeadTimeDays by Supplier
-      - count of Item where Country = Norway
+    Lightweight dataframe Q&A (offline):
+      - "top 20 risk customers"
+      - "average churn score by City"
+      - "count where RiskBand=High and City=Delhi NCR"
+      - "show customers where Model=Brezza and RiskBand in (High,Critical)"
     """
-    ql = q.lower()
-    op = None
-    for k in ["sum","total","avg","average","mean","min","max","count"]:
-        if re.search(rf"\b{k}\b", ql):
-            op = {"sum":"sum","total":"sum","avg":"mean","average":"mean","mean":"mean",
-                  "min":"min","max":"max","count":"count"}[k]
-            break
-    if op is None:
-        op = "sum" if any(c in ql for c in ["revenue","amount","price","value","unitpriceusd"]) else "mean"
+    ql = q.strip().lower()
+    if not ql:
+        return None, "Empty query."
 
     cols = {c.lower(): c for c in df.columns}
-    measure = None
-    for token in re.findall(r"[A-Za-z_]+", ql):
+
+    # Operation detection
+    op = None
+    for k in ["count","avg","average","mean","sum","min","max","top","show","list"]:
+        if re.search(rf"\b{k}\b", ql):
+            op = k
+            break
+    if op is None:
+        op = "show"
+
+    # Measure detection (defaults to ChurnScore if present)
+    measure = cols.get("churnscore", None) or ("ChurnScore" if "ChurnScore" in df.columns else None)
+    for token in re.findall(r"[a-z_]+", ql):
         if token in cols and pd.api.types.is_numeric_dtype(df[cols[token]]):
-            measure = cols[token]; break
-    if measure is None:
-        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        measure = num_cols[0] if num_cols else df.columns[0]
+            measure = cols[token]
+            break
 
-    # Filters
-    filt = {}
-    patterns = [
-        r"where\s+([A-Za-z0-9_ ]+)\s*=\s*([A-Za-z0-9_\-./ ]+)",
-        r"([A-Za-z0-9_ ]+)\s*:\s*([A-Za-z0-9_\-./ ]+)"
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, q, flags=re.IGNORECASE):
-            left, right = m.group(1).strip(), m.group(2).strip()
-            key = cols.get(left.lower())
-            if key and key in df.columns:
-                filt[key] = right
-
-    # Group-by
+    # Group-by detection
     gby = None
-    gbym = re.search(r"\bby\s+([A-Za-z0-9_ ]+)", ql)
-    if gbym:
-        gcol_name = gbym.group(1).strip()
-        gby = cols.get(gcol_name.lower())
+    m = re.search(r"\bby\s+([a-z0-9_ ]+)", ql)
+    if m:
+        gname = m.group(1).strip()
+        gby = cols.get(gname.lower())
+
+    # Filters: "where A=B" and "A=B"
+    filt = {}
+    for pat in [r"where\s+(.+)$", r"filter\s+(.+)$"]:
+        mm = re.search(pat, q, flags=re.IGNORECASE)
+        if mm:
+            tail = mm.group(1)
+            # split on and/or (simple)
+            parts = re.split(r"\band\b", tail, flags=re.IGNORECASE)
+            for p in parts:
+                if "=" in p:
+                    left, right = p.split("=", 1)
+                    left = left.strip()
+                    right = right.strip().strip("'\"")
+                    key = cols.get(left.lower())
+                    if key:
+                        filt[key] = right
+            break
+    # also parse standalone A=B tokens
+    for mm in re.finditer(r"([A-Za-z0-9_ ]+)\s*=\s*([A-Za-z0-9_\-./ ]+)", q):
+        left, right = mm.group(1).strip(), mm.group(2).strip().strip("'\"")
+        key = cols.get(left.lower())
+        if key:
+            filt[key] = right
 
     work = df.copy()
     for k, v in filt.items():
-        vn = safe_number(v)
-        if vn is not None and pd.api.types.is_numeric_dtype(work[k]):
-            work = work[work[k] == vn]
+        if k not in work.columns:
+            continue
+        if pd.api.types.is_numeric_dtype(work[k]):
+            try:
+                work = work[work[k] == float(v)]
+            except:
+                pass
         else:
             work = work[work[k].astype(str).str.lower() == str(v).lower()]
 
-    if gby and gby in work.columns:
-        if op == "count":
-            out = work.groupby(gby)[measure].count().reset_index(name="count")
-        else:
-            out = getattr(work.groupby(gby)[measure], op)().reset_index(name=f"{op.upper()}({measure})")
-        return out, f"{op.upper()}({measure}) by {gby}"
+    # Top N
+    topn = None
+    mm = re.search(r"\btop\s+(\d+)", ql)
+    if mm:
+        topn = int(mm.group(1))
 
-    if op == "count":
-        val = work[measure].count()
-        return val, f"COUNT({measure})"
+    # Special: risk customers
+    if "risk" in ql and ("customer" in ql or "customers" in ql) and ("top" in ql or "show" in ql or "list" in ql):
+        if "ChurnScore" in work.columns:
+            out = work.sort_values("ChurnScore", ascending=False)
+            if topn is None: topn = 20
+            return out.head(topn), f"Top {topn} customers by ChurnScore"
 
-    val = getattr(work[measure], op)()
-    return val, f"{op.upper()}({measure})"
+    # Aggregations
+    if op in ["count"]:
+        if gby and gby in work.columns:
+            out = work.groupby(gby).size().reset_index(name="Count")
+            return out.sort_values("Count", ascending=False), f"COUNT by {gby}"
+        return int(len(work)), "COUNT(rows)"
 
-def call_llm(query, context_text):
-    api = os.getenv("OPENAI_API_KEY", "")
+    if op in ["avg","average","mean","sum","min","max"]:
+        if measure is None:
+            return None, "No numeric measure found to aggregate."
+        func = {"avg":"mean","average":"mean","mean":"mean","sum":"sum","min":"min","max":"max"}[op]
+        if gby and gby in work.columns:
+            out = getattr(work.groupby(gby)[measure], func)().reset_index(name=f"{func.upper()}({measure})")
+            return out.sort_values(out.columns[-1], ascending=False), f"{func.upper()}({measure}) by {gby}"
+        val = getattr(work[measure], func)()
+        return float(val), f"{func.upper()}({measure})"
+
+    # Default show/list
+    if topn:
+        return work.head(topn), f"Showing first {topn} rows after filters"
+    return work.head(50), "Showing first 50 rows after filters"
+
+def optional_llm_answer(query: str, context: str) -> Optional[str]:
+    api = os.getenv("OPENAI_API_KEY","").strip()
     if not api:
-        passages = find_best_passages(query, context_text, topk=2)
-        if not passages:
-            return "No obvious match found in the document."
-        joined = "\n\n".join(passages)
-        return f"Closest passages:\n\n{textwrap.shorten(joined, width=1200)}"
+        return None
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api)
-        prompt = (f"You are a procurement analyst. Use the context to answer the user succinctly. "
-                  f"If unknown, say so.\n\nUser: {query}\n\nContext:\n{context_text[:12000]}")
+        prompt = (
+            "You are a retention analytics assistant for an automotive OEM. "
+            "Answer succinctly using the context (tabular snapshot + metric notes). "
+            "If not supported, say so.\n\n"
+            f"User: {query}\n\nContext:\n{context[:12000]}"
+        )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
             temperature=0.2,
-            max_tokens=400
+            max_tokens=350
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        return f"(LLM disabled) {e}"
+        return f"(LLM error) {e}"
 
-def score_suppliers(df, w_price=0.4, w_lead=0.2, w_ontime=0.1, w_defect=0.1, w_esg=0.1, w_risk=0.1):
+def local_explain_logreg(pipeline: Pipeline, X_row: pd.DataFrame, X_ref: pd.DataFrame, topk: int = 6) -> pd.DataFrame:
     """
-    Compute a normalized composite score per supplier. Lower price/lead/defect/risk is better; higher on-time/ESG is better.
-    Returns a dataframe sorted by score desc.
+    Local explanation using standardized delta from reference mean for logistic regression:
+    contribution ~= coef * (x - mean) in transformed space.
     """
-    work = df.copy()
-    # pick columns if present
-    colmap = {
-        "UnitPriceUSD":"min",
-        "LeadTimeDays":"min",
-        "OnTimePct":"max",
-        "DefectRatePct":"min",
-        "ESGScore":"max",
-        "RiskScore":"min"
-    }
-    # normalize columns 0..1 per column direction
-    for c, direction in colmap.items():
-        if c in work.columns:
-            x = work[c].astype(float)
-            if direction == "min":
-                work[f"norm_{c}"] = 1 - (x - x.min())/(x.max() - x.min() + 1e-9)
-            else:
-                work[f"norm_{c}"] = (x - x.min())/(x.max() - x.min() + 1e-9)
-        else:
-            work[f"norm_{c}"] = 0.5  # neutral if missing
+    model = pipeline.named_steps["model"]
+    pre = pipeline.named_steps["pre"]
+    # transformed matrices
+    Xt = pre.transform(X_row)
+    Xref_t = pre.transform(X_ref)
+    mean_ref = np.asarray(Xref_t.mean(axis=0)).ravel()
+    x = np.asarray(Xt).ravel()
+    coef = model.coef_.ravel()
+    contrib = coef * (x - mean_ref)
+    # feature names
+    try:
+        feat_names = pre.get_feature_names_out()
+    except Exception:
+        feat_names = np.array([f"f{i}" for i in range(len(contrib))])
+    dfc = pd.DataFrame({"Feature":feat_names, "Contribution":contrib})
+    dfc["Abs"] = dfc["Contribution"].abs()
+    dfc = dfc.sort_values("Abs", ascending=False).head(topk).drop(columns=["Abs"])
+    return dfc
 
-    w = dict(price=w_price, lead=w_lead, ontime=w_ontime, defect=w_defect, esg=w_esg, risk=w_risk)
-    work["SupplierScore"] = (
-        w["price"]*work["norm_UnitPriceUSD"] +
-        w["lead"]*work["norm_LeadTimeDays"] +
-        w["ontime"]*work["norm_OnTimePct"] +
-        w["defect"]*work["norm_DefectRatePct"] +
-        w["esg"]*work["norm_ESGScore"] +
-        w["risk"]*work["norm_RiskScore"]
-    )
+# ---------------- Sidebar: data ----------------
+with st.sidebar:
+    st.header("Data & Model")
+    mode = st.radio("Data source", ["Use demo data (synthetic)", "Upload CSV"], index=0)
 
-    agg = work.groupby("Supplier", as_index=False).agg({
-        "UnitPriceUSD":"mean",
-        "LeadTimeDays":"mean",
-        "OnTimePct":"mean",
-        "DefectRatePct":"mean",
-        "ESGScore":"mean",
-        "RiskScore":"mean",
-        "SupplierScore":"mean",
-        "Country":"first"
-    }).sort_values("SupplierScore", ascending=False)
+    uploaded = None
+    if mode == "Upload CSV":
+        uploaded = st.file_uploader("Upload customer CSV", type=["csv"])
 
-    return agg
+    model_choice = st.selectbox("Model", ["Logistic Regression (fast + explainable)", "Random Forest (non-linear)"], index=0)
+    test_size = st.slider("Test size", 0.15, 0.40, 0.25, 0.05)
+    seed = st.number_input("Random seed", 1, 9999, 42)
 
-# ---------- UI: uploads ----------
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📄 Upload Contract / RFP (PDF/DOCX)")
-    doc_file = st.file_uploader("Upload PDF or DOCX", type=["pdf","docx"], key="docxpdf")
+    st.divider()
+    st.subheader("Operational thresholds")
+    critical_cut = st.slider("Critical risk ≥", 0.60, 0.95, 0.75, 0.05)
+    high_cut = st.slider("High risk ≥", 0.35, 0.80, 0.55, 0.05)
+    medium_cut = st.slider("Medium risk ≥", 0.15, 0.60, 0.25, 0.05)
 
-with col2:
-    st.subheader("📈 Upload Supplier Data (XLSX/CSV)")
-    data_file = st.file_uploader("Upload XLSX/CSV", type=["xlsx","csv"], key="csvxlsx")
+    st.caption("RiskBand is derived from these thresholds (Critical/High/Medium/Low).")
 
-doc_text = ""
-if doc_file:
-    if doc_file.name.lower().endswith(".pdf"):
-        doc_text = load_pdf(doc_file)
-    else:
-        doc_text = load_docx(doc_file)
-
-df = None
-if data_file:
-    if data_file.name.lower().endswith(".csv"):
-        df = pd.read_csv(data_file)
-    else:
-        df = pd.read_excel(data_file)
-
-# ---------- Supplier Ranking Panel ----------
-st.divider()
-st.subheader("🏆 Supplier Ranking (click-to-rank)")
-
-if df is not None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1: w_price = st.slider("Weight: Price", 0.0, 1.0, 0.40, 0.05)
-    with c2: w_lead  = st.slider("Lead Time", 0.0, 1.0, 0.20, 0.05)
-    with c3: w_ont   = st.slider("On-Time %", 0.0, 1.0, 0.10, 0.05)
-    with c4: w_def   = st.slider("Defect %", 0.0, 1.0, 0.10, 0.05)
-    with c5: w_esg   = st.slider("ESG Score", 0.0, 1.0, 0.10, 0.05)
-    with c6: w_risk  = st.slider("Risk (lower better)", 0.0, 1.0, 0.10, 0.05)
-
-    total = w_price + w_lead + w_ont + w_def + w_esg + w_risk
-    if abs(total - 1.0) > 1e-6:
-        st.warning(f"Weights sum to {total:.2f}. Consider normalizing to 1 for cleaner interpretation.")
-
-    rank_df = score_suppliers(
-        df,
-        w_price=w_price, w_lead=w_lead, w_ontime=w_ont,
-        w_defect=w_def, w_esg=w_esg, w_risk=w_risk
-    )
-    st.dataframe(rank_df.head(20), use_container_width=True)
+# ---------------- Load data ----------------
+if mode == "Use demo data (synthetic)":
+    df = load_demo_data()
 else:
-    st.info("Upload a supplier dataset to enable ranking. Try the demo Excel in the sidebar →")
+    if not uploaded:
+        st.info("Upload a CSV to proceed. Expected columns similar to the demo dataset.")
+        st.stop()
+    df = pd.read_csv(uploaded)
 
-# ---------- Chat Input ----------
+if TARGET_COL not in df.columns:
+    st.error(f"Target column '{TARGET_COL}' missing. For real deployment, set it using your churn definition (e.g., no service > 12 months).")
+    st.stop()
+if ID_COL not in df.columns:
+    st.error(f"ID column '{ID_COL}' missing.")
+    st.stop()
+
+# ---------------- Feature set ----------------
+num_cols = [c for c in NUM_COLS_DEFAULT if c in df.columns]
+cat_cols = [c for c in CAT_COLS_DEFAULT if c in df.columns]
+bin_cols = [c for c in BIN_COLS_DEFAULT if c in df.columns]
+
+feature_cols = num_cols + cat_cols + bin_cols
+work = df[[ID_COL] + feature_cols + [TARGET_COL]].dropna()
+
+X = work[feature_cols]
+y = work[TARGET_COL].astype(int)
+
+# ---------------- Build model pipeline ----------------
+numeric_features = [c for c in feature_cols if c in num_cols + bin_cols and pd.api.types.is_numeric_dtype(work[c])]
+categorical_features = [c for c in feature_cols if c in cat_cols]
+
+pre = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline(steps=[("scaler", StandardScaler())]), numeric_features),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+    ],
+    remainder="drop"
+)
+
+if model_choice.startswith("Logistic"):
+    model = LogisticRegression(max_iter=2000, n_jobs=None)
+else:
+    model = RandomForestClassifier(
+        n_estimators=350,
+        random_state=int(seed),
+        max_depth=None,
+        min_samples_leaf=10,
+        n_jobs=-1
+    )
+
+pipe = Pipeline(steps=[("pre", pre), ("model", model)])
+
+# ---------------- Train/eval ----------------
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=float(test_size), random_state=int(seed), stratify=y)
+
+pipe.fit(X_train, y_train)
+p_test = pipe.predict_proba(X_test)[:,1]
+
+auc = roc_auc_score(y_test, p_test)
+ap = average_precision_score(y_test, p_test)
+
+# Confusion at 0.5 (for reference)
+yhat = (p_test >= 0.5).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, yhat).ravel()
+
+# Score all customers
+p_all = pipe.predict_proba(X)[:,1]
+scored = work.copy()
+scored["ChurnScore"] = p_all
+
+# Apply user thresholds
+def band(p):
+    if p >= critical_cut: return "Critical"
+    if p >= high_cut: return "High"
+    if p >= medium_cut: return "Medium"
+    return "Low"
+
+scored["RiskBand"] = scored["ChurnScore"].apply(band)
+
+# ---------------- Top KPIs ----------------
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Customers", f"{len(scored):,}")
+k2.metric("Observed churn rate", f"{y.mean()*100:.1f}%")
+k3.metric("Model ROC-AUC", f"{auc:.3f}")
+k4.metric("Avg Precision", f"{ap:.3f}")
+k5.metric("Critical+High", f"{(scored['RiskBand'].isin(['Critical','High']).mean()*100):.1f}%")
+
 st.divider()
-query = st.chat_input("Ask a question about the contract/RFP or supplier spreadsheet…")
+
+# ---------------- Dashboard layout ----------------
+left, right = st.columns([1.25, 1])
+
+with left:
+    st.subheader("📊 Risk distribution & segments")
+
+    # Histogram of churn scores
+    fig = plt.figure()
+    plt.hist(scored["ChurnScore"], bins=30)
+    plt.xlabel("ChurnScore (probability of churn in next 6 months)")
+    plt.ylabel("Customers")
+    st.pyplot(fig, clear_figure=True)
+
+    # Risk by key segment
+    seg_col = st.selectbox("Segment view", ["City","Model","Segment","FuelType","AcquisitionChannel","InsuranceProvider"], index=0)
+    grp = scored.groupby(seg_col)["ChurnScore"].mean().sort_values(ascending=False).head(12)
+    fig2 = plt.figure()
+    plt.bar(grp.index.astype(str), grp.values)
+    plt.xticks(rotation=40, ha="right")
+    plt.ylabel("Average ChurnScore")
+    plt.title(f"Avg risk by {seg_col} (top 12)")
+    st.pyplot(fig2, clear_figure=True)
+
+with right:
+    st.subheader("🚨 Highest-risk customers (triage list)")
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        city_f = st.selectbox("City", ["All"] + sorted(scored["City"].dropna().unique().tolist()), index=0)
+    with f2:
+        model_f = st.selectbox("Model", ["All"] + sorted(scored["Model"].dropna().unique().tolist()), index=0)
+    with f3:
+        band_f = st.selectbox("RiskBand", ["All","Critical","High","Medium","Low"], index=0)
+
+    view = scored.copy()
+    if city_f != "All":
+        view = view[view["City"] == city_f]
+    if model_f != "All":
+        view = view[view["Model"] == model_f]
+    if band_f != "All":
+        view = view[view["RiskBand"] == band_f]
+
+    view = view.sort_values("ChurnScore", ascending=False)
+    st.dataframe(view[[ID_COL,"City","Model","Segment","LastServiceDays","Complaints12M","NPS","WarrantyActive","CompetitorQuoteSeen","ResaleIntent6M","ChurnScore","RiskBand"]].head(30),
+                 use_container_width=True, hide_index=True)
+
+    st.caption("Tip: start with Critical → resolve issues, then High → offer service bundles and loyalty incentives.")
+
+st.divider()
+
+# ---------------- Customer drill-down ----------------
+st.subheader("🔎 Customer drill-down (explain + actions)")
+
+c1, c2 = st.columns([1, 1.2])
+with c1:
+    cust = st.selectbox("Select CustomerID", scored[ID_COL].head(2000).tolist(), index=0)  # avoid huge dropdown
+    row = scored[scored[ID_COL] == cust].iloc[0]
+
+    st.metric("ChurnScore", f"{row['ChurnScore']:.3f}", help="Probability (0..1). Higher means higher churn risk.")
+    st.metric("RiskBand", row["RiskBand"])
+    st.write("**Key profile**")
+    st.write({
+        "City": row.get("City",""),
+        "Model": row.get("Model",""),
+        "Segment": row.get("Segment",""),
+        "CarAgeYears": float(row.get("CarAgeYears", np.nan)),
+        "OdometerKM": int(row.get("OdometerKM", 0)),
+        "LastServiceDays": int(row.get("LastServiceDays", 0)),
+        "ServiceVisits12M": int(row.get("ServiceVisits12M", 0)),
+        "Complaints12M": int(row.get("Complaints12M", 0)),
+        "NPS": int(row.get("NPS", 0)),
+        "WarrantyActive": int(row.get("WarrantyActive", 0)),
+        "CompetitorQuoteSeen": int(row.get("CompetitorQuoteSeen", 0)),
+        "ResaleIntent6M": int(row.get("ResaleIntent6M", 0)),
+    })
+
+with c2:
+    st.write("**Local driver explanation**")
+    if model_choice.startswith("Logistic"):
+        # local explanation against training reference
+        X_row = X.loc[[work.index[work[ID_COL] == cust][0]]]
+        expl = local_explain_logreg(pipe, X_row=X_row, X_ref=X_train, topk=8)
+        st.dataframe(expl, use_container_width=True, hide_index=True)
+        st.caption("Contributions are approximate in transformed feature space; positive contributions increase churn risk.")
+    else:
+        st.info("Local per-customer explanations are enabled for Logistic Regression. For Random Forest, use the global importances below.")
+
+    headline, actions = retention_playbook(row)
+    st.write("**Recommended retention actions**")
+    st.write(f"**{headline}**")
+    for a in actions:
+        st.write(f"- {a}")
+
+st.divider()
+
+# ---------------- Global drivers ----------------
+st.subheader("🧠 Global risk drivers (what moves churn)")
+
+if model_choice.startswith("Logistic"):
+    model = pipe.named_steps["model"]
+    pre = pipe.named_steps["pre"]
+    try:
+        feat_names = pre.get_feature_names_out()
+        coefs = model.coef_.ravel()
+        imp = pd.DataFrame({"Feature": feat_names, "Coefficient": coefs})
+        imp["Abs"] = imp["Coefficient"].abs()
+        imp = imp.sort_values("Abs", ascending=False).head(18).drop(columns=["Abs"])
+        st.dataframe(imp, use_container_width=True, hide_index=True)
+        st.caption("For Logistic Regression, positive coefficient increases churn risk; negative decreases.")
+    except Exception as e:
+        st.write(f"Could not extract coefficients: {e}")
+else:
+    # crude feature importance using impurity + feature names (best-effort)
+    try:
+        pre = pipe.named_steps["pre"]
+        model = pipe.named_steps["model"]
+        feat_names = pre.get_feature_names_out()
+        imp = pd.DataFrame({"Feature": feat_names, "Importance": model.feature_importances_})
+        imp = imp.sort_values("Importance", ascending=False).head(20)
+        st.dataframe(imp, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.write(f"Could not extract importances: {e}")
+
+st.divider()
+
+# ---------------- Query / Chat ----------------
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+st.subheader("💬 Ask questions (data Q&A + optional LLM)")
+st.caption("Offline queries work without API key. Examples: “top 20 risk customers where City=Delhi NCR”, “average ChurnScore by Model”, “count where RiskBand=Critical”")
 
 def add_msg(role, content):
     st.session_state.history.append({"role": role, "content": content})
 
-chat = st.container()
-with chat:
-    for m in st.session_state.history:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+for m in st.session_state.history[-20:]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-    if query:
-        with st.chat_message("user"):
-            st.markdown(query)
-        add_msg("user", query)
+q = st.chat_input("Ask a question about retention risk data…")
 
-        answer_parts = []
+if q:
+    with st.chat_message("user"):
+        st.markdown(q)
+    add_msg("user", q)
 
-        if doc_text:
-            ans = call_llm(query, doc_text)
-            answer_parts.append(f"**Contract/RFP insight**\n\n{ans}")
+    # Make a compact context snapshot for optional LLM
+    snap = scored.sort_values("ChurnScore", ascending=False).head(12)[
+        [ID_COL,"City","Model","LastServiceDays","Complaints12M","NPS","WarrantyActive","CompetitorQuoteSeen","ResaleIntent6M","ChurnScore","RiskBand"]
+    ]
+    notes = f"Metrics: AUC={auc:.3f}, AP={ap:.3f}. Thresholds: Medium>={medium_cut}, High>={high_cut}, Critical>={critical_cut}."
+    context = notes + "\n\nTop-risk snapshot:\n" + snap.to_csv(index=False)
 
-        if df is not None:
-            try:
-                val, formula = parse_excel_query(query, df)
-                if isinstance(val, pd.DataFrame):
-                    st.dataframe(val)
-                    answer_parts.append(f"**Supplier calc** — inferred: `{formula}`")
-                else:
-                    answer_parts.append(f"**Supplier calc** — inferred: `{formula}` → **{val:,.2f}**")
-            except Exception as e:
-                answer_parts.append(f"Supplier calc error: {e}")
+    df_ans, formula = parse_df_query(q, scored)
+    llm_ans = optional_llm_answer(q, context)
 
-        if not answer_parts:
-            answer_parts.append("Please upload a contract/RFP or a supplier spreadsheet first.")
+    with st.chat_message("assistant"):
+        if isinstance(df_ans, pd.DataFrame):
+            st.dataframe(df_ans, use_container_width=True, hide_index=True)
+            st.markdown(f"**Calc (offline):** `{formula}`")
+        elif df_ans is not None:
+            st.markdown(f"**Calc (offline):** `{formula}` → **{df_ans:,.4f}**")
+        else:
+            st.markdown(f"**Calc (offline):** {formula}")
 
-        with st.chat_message("assistant"):
-            st.markdown("\n\n".join(answer_parts))
-        add_msg("assistant", "\n\n".join(answer_parts))
+        if llm_ans:
+            st.markdown("---")
+            st.markdown(f"**LLM insight:**\n\n{llm_ans}")
 
-# ---------- Sidebar help ----------
+    # store a short assistant message (avoid storing full dataframes)
+    add_msg("assistant", f"Offline: {formula}" + (f"\n\nLLM: {llm_ans}" if llm_ans else ""))
+
 with st.sidebar:
-    st.header("Demo Files & Tips")
-    st.markdown("""
-**Download demo files**
-- [Supplier Excel demo](sandbox:/mnt/data/procurement_demo.xlsx)
-- [RFP/Contract PDF demo](sandbox:/mnt/data/RFP_example.pdf)
-
-**Prompts to try**
-- “Extract delivery and warranty terms from the contract.”
-- “List ESG requirements and minimum scores.”
-- “Average UnitPriceUSD by Supplier for Fibre Cable.”
-- “Sum of UnitPriceUSD where Country = Norway and Category = ‘RAN Antenna’.”
-- “LeadTimeDays by Supplier; sort ascending.”
-
-**Notes**
-- LLM is optional. Set `OPENAI_API_KEY` for semantic answers.
-- Spreadsheet Q&A and Supplier Ranking work fully offline.
-""")
+    st.divider()
+    st.header("How to run")
+    st.code("pip install -r requirements.txt\nstreamlit run app_retention_risk_dashboard.py", language="bash")
