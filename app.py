@@ -17,11 +17,11 @@ from sklearn.ensemble import RandomForestClassifier
 # Page
 # ===========================
 st.set_page_config(
-    page_title="Maruti Suzuki — Customer Decisive Retention Dashboard",
+    page_title="Customer Decisive Retention Dashboard",
     page_icon="🚗",
     layout="wide",
 )
-st.title("🚗 Maruti Suzuki — Customer Decisive Retention Dashboard")
+st.title("Customer Decisive Retention Dashboard")
 st.caption(
     "Primary: detect the *decision moment* (next 30 days) when a customer is ready to switch/upgrade. "
     "Secondary: churn risk (next 6 months). Works offline; optional LLM Q&A if OPENAI_API_KEY is set."
